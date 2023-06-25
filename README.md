@@ -1,7 +1,7 @@
 # jaws-x
 
 This repository contains code for two papers:
-(1) JAWS-X: Addressing Efficiency Bottlenecks of Conformal Prediction Under Standard and Feedback Covariate Shift, ICML 2023.
+(1) JAWS-X: Addressing Efficiency Bottlenecks of Conformal Prediction Under Standard and Feedback Covariate Shift, ICML, 2023.
 (2) Efficient Approximate Predictive Inference Under Feedback Covariate Shift with Influence Functions, COPA, 2023.
 
 Cleaned-up code will be updated to the repository by July 21st, 2023.
