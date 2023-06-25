@@ -1,4 +1,4 @@
-# jawa-x
+# jaws-x
 
 This repository contains code for two papers:
 (1) JAWS-X: Addressing Efficiency Bottlenecks of Conformal Prediction Under Standard and Feedback Covariate Shift, ICML 2023.
