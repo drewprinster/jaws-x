@@ -808,7 +808,7 @@ class JAW_FCS_IFs(ABC):
     
         
     
-    def compute_PIs_IFs(self, Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_n1, pred_train_test, Xtrain_split, Xcal_split, ytrain_split, ycal_split, Xtest_n1xp_split, ytest_n1_split, pred_cal_test_split, params, params_split, lmbda, alpha: float = 0.1, K_vals = [8, 12, 16, 24, 32, 48], L2_lambda = 5.0):
+    def compute_PIs_IFs(self, Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_n1, pred_train_test, Xtrain_split, Xcal_split, ytrain_split, ycal_split, Xtest_n1xp_split, ytest_n1_split, pred_cal_test_split, params, params_split, lmbda, alpha: float = 0.1, K_vals = [8, 12, 16, 24, 32, 48], L2_lambda = 5.0, runtime_expts=0):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
@@ -830,7 +830,6 @@ class JAW_FCS_IFs(ABC):
         beta = 1.0
 
 #         print("Dataset = ", dataset)
-        print("\nTime beginning IFs : ", datetime.now())
 
         model = bayesnn.MLP(n_inputs, n_hidden)
         init_params = model.init_params(rng)
@@ -860,7 +859,7 @@ class JAW_FCS_IFs(ABC):
         beta = 1.0
 
 #         print("Dataset = ", dataset)
-        print("\nTime beginning IFs : ", datetime.now())
+        
 
         model_split = bayesnn.MLP(n_inputs, n_hidden)
         init_params_split = model_split.init_params(rng)
@@ -937,7 +936,7 @@ class JAW_FCS_IFs(ABC):
         
         
         
-
+        print("\nTime beginning IFs HERE : ", datetime.now())
         
         
 
@@ -946,12 +945,12 @@ class JAW_FCS_IFs(ABC):
         ###############################
     #     print("likelihood_all", likelihood_all(params, X, Y, weights))
         H = autograd.hessian(objective, 0)(params, Xtrain_nxp, ytrain_n, weights) ## Changed this to objective
-    #     H_lik = autograd.hessian(likelihood_all, 0)(params, X, Y, weights)
-    #     eigenvalues_lik, eigenvectors_lik = np.linalg.eig(H_lik)
-    #     print("mean eigenvalue H_lik: ", np.mean(eigenvalues_lik))
+###         H_lik = autograd.hessian(likelihood_all, 0)(params, X, Y, weights)
+###         eigenvalues_lik, eigenvectors_lik = np.linalg.eig(H_lik)
+###         print("mean eigenvalue H_lik: ", np.mean(eigenvalues_lik))
         print("H : ", H)
         max_damp_limit = 10
-        damp_search = np.linspace(0.1, max_damp_limit, 10*max_damp_limit+1)
+        damp_search = np.linspace(0.1, max_damp_limit, 4*max_damp_limit+1)
 
         for damp in damp_search:
             rank = np.linalg.matrix_rank(H + damp * np.eye(len(H)))
@@ -1020,14 +1019,41 @@ class JAW_FCS_IFs(ABC):
             unnormalized_weights_JAW_FCS_IF3[i] = (np.exp(lmbda * muh_i_LOO_IF3) / (self.ptrain_fn(Xaug_n1xp[i][None, :]))) * (np.exp(lmbda * muh_LOO_vals_testpoint_IF3[i]) / (self.ptrain_fn(Xaug_n1xp[-n1:][None, :])))
 
         ind_q = (np.ceil((1-alpha)*(n+1))).astype(int)
-
+        
+        print("\nTime ending IFs HERE : ", datetime.now())
         
         ###############################
         # End IFs inserted
         ###############################
         
         
+        ###############################
+        # Runtime experiments?
+        ###############################
         
+        if (runtime_expts == 1):
+            print("\nTime beginning JAW-FCS computation : ", datetime.now())
+            for i in range(n):
+                rng = np.random.RandomState(0) ## Generate random state with seed=0
+                n_train, n_inputs = Xtrain_nxp.shape
+                n_hidden = 25
+                model_runtime = bayesnn.MLP(n_inputs, n_hidden)
+
+                init_params_runtime = model_runtime.init_params(rng)
+
+                weights_runtime = np.ones(n_train)
+                weights_runtime[i] = 0
+
+                objective_runtime, likelihood_runtime, prior_runtime, likelihood_all_runtime = bayesnn.make_objective(model_runtime, alphas, beta, n_train, weights_runtime)
+
+                config_runtime = bayesnn.init_sgd_config()
+                config_runtime['n_epochs'] = 2000
+                config_runtime['batch_size'] = 50
+
+                params_runtime = bayesnn.train(objective_runtime, init_params_runtime, Xtrain_nxp, ytrain_n, config_runtime, weights_runtime)
+                muh_vals_testpoint_runtime = model_runtime.predict(params_runtime, Xaug_n1xp[-n1:]) ## Same as muh_vals_testpoint
+            
+            print("\nTime ending JAW-FCS computation : ", datetime.now())
         
         
         
