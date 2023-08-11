@@ -21,6 +21,20 @@ from abc import ABC, abstractmethod
 import math
 import pandas as pd
 import random
+from sklearn.neighbors import KernelDensity
+
+
+# ===== utilities for KDE density estimation =====
+
+def KDE_density_estimates(X, bandwidth=0.5):
+    kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(X)
+    density = np.exp(kde.score_samples(X))
+    return density / np.sum(density)
+
+## Compute test density for active learning experiments
+def std_to_test_density(std_vals):
+    var_vals = std_vals**2
+    return var_vals / np.sum(var_vals)
 
 # ===== utilities for split conformal =====
 
@@ -207,6 +221,18 @@ def weighted_quantile(v, w_normalized, q):
         else:
             return v_sorted[0]
 
+        
+# ========== utilities and classes for weight estimation with probabilistic classification ==========
+        
+def logistic_regression_weight_est(X, class_labels):
+    clf = LogisticRegression(random_state=0).fit(X, class_labels)
+    lr_probs = clf.predict_proba(X)
+    return lr_probs[:,1] / lr_probs[:,0]
+
+def random_forest_weight_est(X, class_labels, ntree=100):
+    rf = RandomForestClassifier(n_estimators=ntree,criterion='entropy', min_weight_fraction_leaf=0.1).fit(X, class_labels)
+    rf_probs = rf.predict_proba(X)
+    return rf_probs[:,1] / rf_probs[:,0]
 
 
 # ========== utilities and classes for full conformal with ridge regression ==========
@@ -644,6 +670,8 @@ class Conformal(ABC):
         return np.array(cs), scores_n1xy, w_n1xy
 
     
+    
+    
 ### Drew modified
 class JAW_FCS(ABC):
     """
@@ -683,9 +711,10 @@ class JAW_FCS(ABC):
         resids_LOO = np.zeros(n)
         muh_LOO_vals_testpoint = np.zeros((n,n1))
         
-        # Weights
+        # Oracle weights
         unnormalized_weights_JAW_FCS = np.zeros((n + 1, n1))
         unnormalized_weights_JAW_SCS = np.zeros((n + 1, n1))
+        
         
         for i in range(n):
             ## Create LOO X and y data
@@ -697,7 +726,13 @@ class JAW_FCS(ABC):
             muh_i_LOO = self.model.predict(Xaug_n1xp[i].reshape(1, -1)) ## ith LOO prediction on point i : mu_{-i}(X_i)
             resids_LOO[i] = np.abs(ytrain_n[i] - muh_i_LOO) ## ith LOO residual
             muh_LOO_vals_testpoint[i] = self.model.predict(Xaug_n1xp[-n1:]).T ## ith LOO prediction on test point n+1 : mu_{-i}(X_{n+1})
-           
+            
+            ## Estimated weights (logistic regression and random forest)
+            source_target_labels = np.concatenate([np.zeros(len(Xi_LOO_n_minus_1xp)), np.ones(len(X1))])
+            weights_lr = logistic_regression_weight_est(X_full, source_target_labels)
+            weights_rf = random_forest_weight_est(X_full, source_target_labels)
+        
+        
             ## Calculate unnormalized likelihoo-ratio weights for FCS
             unnormalized_weights_JAW_FCS[i] = (np.exp(lmbda * muh_i_LOO) / (self.ptrain_fn(Xaug_n1xp[i][None, :]))) * (np.exp(lmbda * muh_LOO_vals_testpoint[i]) / (self.ptrain_fn(Xaug_n1xp[-n1:][None, :])))
             
@@ -768,7 +803,7 @@ class JAW_FCS(ABC):
     
         
     
-    def compute_PIs(self, Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_n1, pred_train_test, Xtrain_split, Xcal_split, ytrain_split, ycal_split, Xtest_n1xp_split, ytest_n1_split, pred_cal_test_split, lmbda, alpha: float = 0.1, K_vals = [8, 12, 16, 24, 32, 48], run_split=False):
+    def compute_PIs(self, Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_n1, pred_train_test, Xtrain_split, Xcal_split, ytrain_split, ycal_split, Xtest_n1xp_split, ytest_n1_split, pred_cal_test_split, lmbda, alpha: float = 0.1, K_vals = [8, 12, 16, 24, 32, 48]):
         if (self.p != Xtrain_nxp.shape[1]):
             raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
                 Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
@@ -1120,6 +1155,525 @@ class JAW_FCS(ABC):
         return PIs_dict
     
     
+    
+    
+### 
+### 
+### 
+### ACTIVE LEARNING EXPERIMENTS
+### 
+### 
+### 
+class JAW_FCS_ACTIVE(ABC):
+    """
+    Abstract base class for JAW with ridge regression mu function, based on class for full conformal
+    """
+    def __init__(self, model, ptrain_fn, Xuniv_uxp):
+        """
+        :param model: object with predict() method
+        :param ptrain_fn: function that outputs likelihood of input under training input distribution, p_X
+        :param Xuniv_uxp: (u, p) numpy array encoding all sequences in domain (e.g., all 2^13 sequences
+            in Poelwijk et al. 2019 data set), needed for computing normalizing constant
+        """
+        self.model = model
+        self.ptrain_fn = ptrain_fn
+        self.Xuniv_uxp = Xuniv_uxp
+        self.p = Xuniv_uxp.shape[1]
+
+    def get_normalizing_constant(self, beta_p, lmbda):
+        predall_u = self.Xuniv_uxp.dot(beta_p)
+        Z = np.sum(np.exp(lmbda * predall_u))
+        return Z
+
+    def compute_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        """
+        Compute jackknife+ LOO scores, i.e. residuals using model trained on *n-1* data points (n-1 training points, no candidate test points).
+
+        :param Xaug_n1xp: (n + 1, p) numpy array encoding all n + 1 sequences (training + candidate test point)
+        :param ytrain_n: (n,) numpy array of true labels for the n training points
+        :param lmbda: float, inverse temperature of design algorithm in Eq. 6, {0, 2, 4, 6} in main paper
+        :param compute_lrs: bool: whether or not to compute likelihood ratios (this part takes the longest,
+            so set to False if only want to compute scores)
+        :return: (n + 1, |Y|) numpy arrays of scores S_i(X_test, y) and weights w_i^y(X_test) in Eq. 3 in main paper
+        """
+        # Compute jackknife+ LOO residuals, test point predictions, and weights
+        n = ytrain_n.size
+        n1 = len(Xaug_n1xp) - n
+        resids_LOO = np.zeros(n)
+        muh_LOO_vals_testpoint = np.zeros((n,n1))
+        
+        # Oracle weights
+        unnormalized_weights_JAW_FCS = np.zeros((n + 1, n1))
+        unnormalized_weights_JAW_SCS = np.zeros((n + 1, n1))
+        
+        
+        for i in range(n):
+            ## Create LOO X and y data
+            Xi_LOO_n_minus_1xp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 : n]]) ## LOO training data inputs
+            yi_LOO_train_n = np.concatenate((ytrain_n[: i], ytrain_n[i + 1 : n])) ## LOO training data outputs
+            
+            ## Get LOO residuals and test point predictions
+            self.model.fit(Xi_LOO_n_minus_1xp, yi_LOO_train_n)
+            muh_i_LOO = self.model.predict(Xaug_n1xp[i].reshape(1, -1)) ## ith LOO prediction on point i : mu_{-i}(X_i)
+            resids_LOO[i] = np.abs(ytrain_n[i] - muh_i_LOO) ## ith LOO residual
+            muh_LOO_vals_testpoint[i] = self.model.predict(Xaug_n1xp[-n1:]).T ## ith LOO prediction on test point n+1 : mu_{-i}(X_{n+1})
+            
+            ## Estimated weights (logistic regression and random forest)
+            source_target_labels = np.concatenate([np.zeros(len(Xi_LOO_n_minus_1xp)), np.ones(len(X1))])
+            weights_lr = logistic_regression_weight_est(X_full, source_target_labels)
+            weights_rf = random_forest_weight_est(X_full, source_target_labels)
+        
+        
+            ## Calculate unnormalized likelihoo-ratio weights for FCS
+            unnormalized_weights_JAW_FCS[i] = (np.exp(lmbda * muh_i_LOO) / (self.ptrain_fn(Xaug_n1xp[i][None, :]))) * (np.exp(lmbda * muh_LOO_vals_testpoint[i]) / (self.ptrain_fn(Xaug_n1xp[-n1:][None, :])))
+            
+            
+        for j in range(n1):
+            ## Calculate unnormalized likelihoo-ratio weights for SCS
+            unnormalized_weights_JAW_SCS[:, j] = self.get_lrs(Xaug_n1xp, ytrain_n, lmbda)
+            
+            
+                        
+        ## Compute jackknife+ upper and lower predictive values
+        unweighted_lower_vals = (muh_LOO_vals_testpoint.T - resids_LOO).T
+        unweighted_upper_vals = (muh_LOO_vals_testpoint.T + resids_LOO).T
+        
+        
+        ## Add infinity
+        unweighted_lower_vals = np.vstack((unweighted_lower_vals, -math.inf*np.ones(n1)))
+        unweighted_upper_vals = np.vstack((unweighted_upper_vals, math.inf*np.ones(n1)))
+        
+        
+        ## Calculate test point unnormalized weight
+        self.model.fit(Xaug_n1xp[: -n1], ytrain_n)
+        muh_test = self.model.predict(Xaug_n1xp[-n1:])
+        unnormalized_weights_JAW_FCS[n] = (np.exp(lmbda * muh_test) / self.ptrain_fn(Xaug_n1xp[-n1:][None, :]))**2
+        
+        weights_normalized_JAW_FCS = np.zeros((n + 1, n1))
+        weights_normalized_JAW_SCS = np.zeros((n + 1, n1))
+        for j in range(0, n1):
+            weights_normalized_JAW_FCS[:,j] = unnormalized_weights_JAW_FCS[:,j] / np.sum(unnormalized_weights_JAW_FCS[:,j])
+            weights_normalized_JAW_SCS[:,j] = unnormalized_weights_JAW_SCS[:,j] / np.sum(unnormalized_weights_JAW_SCS[:,j])
+        
+        return unweighted_lower_vals, unweighted_upper_vals, weights_normalized_JAW_FCS, weights_normalized_JAW_SCS
+
+    @abstractmethod
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        pass
+
+    def get_confidence_set(self, Xtrain_nxp, ytrain_n, Xtest_1xp, lmbda, alpha: float = 0.1):
+        if (self.p != Xtrain_nxp.shape[1]):
+            raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
+                Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
+        Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
+        n1 = len(Xtest_1xp)
+
+        # ===== compute scores and weights =====
+
+        # compute LOO scores and likelihood ratios
+        unweighted_lower_vals, unweighted_upper_vals, weights_normalized_JAW_FCS, weights_normalized_JAW_SCS = self.get_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda)
+
+        # ===== construct confidence intervals for FCS and SCS =====
+        y_lower_JAW_FCS = np.zeros(n1)
+        y_upper_JAW_FCS = np.zeros(n1)
+        y_lower_JAW_SCS = np.zeros(n1)
+        y_upper_JAW_SCS = np.zeros(n1)
+        y_lower_Jplus = np.zeros(n1)
+        y_upper_Jplus = np.zeros(n1)
+        uniform_weights = np.ones(n+1) / (n+1)
+        for j in range(0, n1):
+            y_lower_JAW_FCS[j] = weighted_quantile(unweighted_lower_vals[:, j], weights_normalized_JAW_FCS[:, j], alpha)
+            y_upper_JAW_FCS[j] = weighted_quantile(unweighted_upper_vals[:, j], weights_normalized_JAW_FCS[:, j], 1 - alpha)
+            y_lower_JAW_SCS[j] = weighted_quantile(unweighted_lower_vals[:, j], weights_normalized_JAW_SCS[:, j], alpha)
+            y_upper_JAW_SCS[j] = weighted_quantile(unweighted_upper_vals[:, j], weights_normalized_JAW_SCS[:, j], 1 - alpha)
+            y_lower_Jplus[j] = weighted_quantile(unweighted_lower_vals[:, j], uniform_weights, alpha)
+            y_upper_Jplus[j] = weighted_quantile(unweighted_upper_vals[:, j], uniform_weights, 1 - alpha)
+            
+        return y_lower_JAW_FCS, y_upper_JAW_FCS, y_lower_JAW_SCS, y_upper_JAW_SCS, y_lower_Jplus, y_upper_Jplus
+
+    
+
+        
+    
+    def compute_PIs_active(self, Xtrain_nxp, ytrain_n, Xtest_1xp, ytest_n1, Xtrain_split, Xcal_split, ytrain_split, ycal_split, Xtest_n1xp_split, ytest_n1_split, bandwidth = 1.0, alpha: float = 0.1, K_vals = [8, 12, 16, 24, 32, 48]):
+        if (self.p != Xtrain_nxp.shape[1]):
+            raise ValueError('Feature dimension {} differs from provided Xuniv_uxp {}'.format(
+                Xtrain_nxp.shape[1], self.Xuniv_uxp.shape))
+        Xaug_n1xp = np.vstack([Xtrain_nxp, Xtest_1xp])
+        Xaug_cal_test_split = np.vstack([Xcal_split, Xtest_1xp])
+        n = ytrain_n.size
+        n1 = len(Xaug_n1xp) - n
+        
+        kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xtrain_nxp)
+        
+        ###############################
+        # split conformal
+        ###############################
+        n_cal = len(ycal_split)
+        muh_split = self.model.fit(Xtrain_split, ytrain_split)
+        muh_split_vals, std_split_vals = muh_split.predict(np.r_[Xcal_split,Xtest_n1xp_split], return_std=True)
+        resids_split = np.abs(ycal_split-muh_split_vals[:n_cal])
+        muh_split_vals_testpoint = muh_split_vals[n_cal:]
+        ind_split = (np.ceil((1-alpha)*(n_cal+1))).astype(int)
+
+        ###############################
+        # weighted split conformal
+        ###############################
+#         predall_n = self.model.predict(self.Xuniv_uxp)
+#         Z = np.sum(np.exp(lmbda * predall_n))
+        
+        wsplit_ptest_n1 = std_to_test_density(std_split_vals)
+        kde_split = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xtrain_split) ## Fit density for n-1 pts
+        density_cal_test_split = np.exp(kde_split.score_samples(Xaug_cal_test_split))
+        density_cal_test_split = density_cal_test_split / np.sum(density_cal_test_split)
+        SCS_split_weights_vec = wsplit_ptest_n1 / density_cal_test_split
+        
+        
+
+        ## Add infty (distribution on augmented real line)
+        positive_infinity = np.array([float('inf')])
+        unweighted_split_vals = np.concatenate([resids_split, positive_infinity])
+
+        wsplit_quantiles = np.zeros(n1)
+
+        weights_normalized_wsplit = np.zeros((n_cal + 1, n1))
+        sum_cal_weights = np.sum(SCS_split_weights_vec[:n_cal])
+        for j in range(0, n1):
+            for i in range(0, n_cal + 1):
+                if (i < n_cal):
+#                     i_cal = idx_cal[i]
+                    weights_normalized_wsplit[i, j] = SCS_split_weights_vec[i] / (sum_cal_weights + SCS_split_weights_vec[n_cal + j])
+                else:
+                    weights_normalized_wsplit[i, j] = SCS_split_weights_vec[n_cal+j] / (sum_cal_weights + SCS_split_weights_vec[n_cal + j])
+
+        
+        wsplit_quantiles_lower = np.zeros(n1)
+        wsplit_quantiles_upper = np.zeros(n1)
+        for j in range(0, n1):
+#             C_n = get_randomized_staircase_confidence_set(resids_split, weights_normalized_wsplit[:, j], pred_cal_test_split[(n-n_half) + j])
+#             print("C_n", C_n)
+#             wsplit_quantiles_lower[j] = C_n[0][0]
+#             wsplit_quantiles_upper[j] = C_n[0][1]
+#             wsplit_quantiles[j] = get_randomized_staircase_coverage(C_n, ytest_n1_split)
+            wsplit_quantiles[j] = weighted_quantile(unweighted_split_vals, weights_normalized_wsplit[:, j], 1 - alpha)
+        
+        
+        ###############################
+        # JAW FCS & SCS
+        ###############################
+        
+        # Compute jackknife+ LOO residuals, test point predictions, and weights
+        resids_LOO = np.zeros(n)
+        muh_LOO_vals_testpoint = np.zeros((n,n1))
+        
+        # Weights
+        unnormalized_weights_JAW_FCS = np.zeros((n + 1, n1))
+        unnormalized_weights_JAW_SCS = np.zeros((n + 1, n1))
+
+        
+        for i in range(n):
+            ## Create LOO X and y data
+            Xi_LOO_n_minus_1xp = np.vstack([Xaug_n1xp[: i], Xaug_n1xp[i + 1 : n]]) ## LOO training data inputs
+            yi_LOO_train_n = np.concatenate((ytrain_n[: i], ytrain_n[i + 1 : n])) ## LOO training data outputs
+            
+            ## Get LOO residuals and test point predictions
+            self.model.fit(Xi_LOO_n_minus_1xp, yi_LOO_train_n)
+            muh_i_LOO, std_i_LOO  = self.model.predict(Xaug_n1xp[i].reshape(1, -1), return_std=True) ## ith LOO prediction on point i : mu_{-i}(X_i)
+            resids_LOO[i] = np.abs(ytrain_n[i] - muh_i_LOO) ## ith LOO residual
+            muh_LOO_vals_testpoint_i, std_LOO_vals_testpoint_i = self.model.predict(Xaug_n1xp[-n1:], return_std=True)
+            muh_LOO_vals_testpoint[i] = muh_LOO_vals_testpoint_i
+            
+#             kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xi_LOO_n_minus_1xp) ## Fit density for n-1 pts
+            density_i = np.exp(kde.score_samples(Xaug_n1xp[i][None, :]))
+            density_i = density_i / np.sum(density_i)
+            density_testpoint_i = np.exp(kde.score_samples(Xaug_n1xp[-n1:]))
+            density_testpoint_i = density_testpoint_i / np.sum(density_testpoint_i)
+            
+#             print("std_to_test_density(std_i_LOO)", np.shape(std_to_test_density(std_i_LOO)))
+#             print("density_i", np.shape(density_i))
+#             print("std_to_test_density(std_LOO_vals_testpoint_i)", np.shape(std_to_test_density(std_LOO_vals_testpoint_i)))
+#             print("density_testpoint_i", np.shape(density_testpoint_i))
+            unnormalized_weights_JAW_FCS[i] = (std_to_test_density(std_i_LOO) / density_i) * (std_to_test_density(std_LOO_vals_testpoint_i) / density_testpoint_i)
+            
+        ## Calculate FCS test point unnormalized weight
+        self.model.fit(Xaug_n1xp[: -n1], ytrain_n)
+        muh_test, std_test = self.model.predict(Xaug_n1xp[-n1:], return_std=True) ## did have np.exp(lmbda * pred_train_test[-n1:])
+#         kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xtrain_nxp) ## Fit density for n pts
+        density_testpoint = np.exp(kde.score_samples(Xaug_n1xp[-n1:])) ## Score test points
+        density_testpoint = density_testpoint / np.sum(density_testpoint)
+        unnormalized_weights_JAW_FCS[n] = (std_to_test_density(std_test) / density_testpoint)**2
+            
+        ## Standard covariate shift weights
+        muh_train_test, std_train_test = self.model.predict(Xaug_n1xp, return_std=True)
+        ptest_train_test = std_to_test_density(std_train_test) # pred_train_test
+#         SCS_weights_vec = self.get_lrs(Xaug_n1xp, ytrain_n, lmbda)
+        density_train_test = np.exp(kde.score_samples(Xaug_n1xp)) ## Score test points
+        density_train_test = density_train_test / np.sum(density_train_test)
+        SCS_weights_vec = ptest_train_test / density_train_test
+        weights_normalized_JAW_SCS = np.zeros((n + 1, n1))
+        sum_train_weights = np.sum(SCS_weights_vec[0:n])
+        for j in range(0, n1):
+            for i in range(0, n + 1):
+                if (i < n):
+                    weights_normalized_JAW_SCS[i, j] = SCS_weights_vec[i] / (sum_train_weights + SCS_weights_vec[n + j])
+                else:
+                    weights_normalized_JAW_SCS[i, j] = SCS_weights_vec[n+j] / (sum_train_weights + SCS_weights_vec[n + j])
+
+                        
+        ## Compute jackknife+ upper and lower predictive values
+        unweighted_lower_vals = (muh_LOO_vals_testpoint.T - resids_LOO).T
+        unweighted_upper_vals = (muh_LOO_vals_testpoint.T + resids_LOO).T
+        
+
+        ## Add infinity
+        unweighted_lower_vals = np.vstack((unweighted_lower_vals, -math.inf*np.ones(n1)))
+        unweighted_upper_vals = np.vstack((unweighted_upper_vals, math.inf*np.ones(n1)))
+        
+
+        
+        weights_normalized_JAW_FCS = np.zeros((n + 1, n1))
+        for j in range(0, n1):
+            weights_normalized_JAW_FCS[:,j] = unnormalized_weights_JAW_FCS[:,j] / np.sum(unnormalized_weights_JAW_FCS[:,j])
+        
+        # ===== construct confidence intervals for FCS and SCS =====
+        y_lower_JAW_FCS = np.zeros(n1)
+        y_upper_JAW_FCS = np.zeros(n1)
+        y_lower_JAW_SCS = np.zeros(n1)
+        y_upper_JAW_SCS = np.zeros(n1)
+        y_lower_Jplus = np.zeros(n1)
+        y_upper_Jplus = np.zeros(n1)
+        uniform_weights = np.ones(n+1) / (n+1)
+        for j in range(0, n1):
+            y_lower_JAW_FCS[j] = weighted_quantile(unweighted_lower_vals[:, j], weights_normalized_JAW_FCS[:, j], alpha)
+            y_upper_JAW_FCS[j] = weighted_quantile(unweighted_upper_vals[:, j], weights_normalized_JAW_FCS[:, j], 1 - alpha)
+            y_lower_JAW_SCS[j] = weighted_quantile(unweighted_lower_vals[:, j], weights_normalized_JAW_SCS[:, j], alpha)
+            y_upper_JAW_SCS[j] = weighted_quantile(unweighted_upper_vals[:, j], weights_normalized_JAW_SCS[:, j], 1 - alpha)
+            y_lower_Jplus[j] = weighted_quantile(unweighted_lower_vals[:, j], uniform_weights, alpha)
+            y_upper_Jplus[j] = weighted_quantile(unweighted_upper_vals[:, j], uniform_weights, 1 - alpha)
+            
+            
+        ## Add PIs for initially non JAW or K-dependent methods
+        PIs_dict = {'JAW-FCS' : pd.DataFrame(np.c_[y_lower_JAW_FCS, \
+                        y_upper_JAW_FCS],\
+                           columns = ['lower','upper']),\
+                'JAW-SCS' : pd.DataFrame(np.c_[y_lower_JAW_SCS, \
+                        y_upper_JAW_SCS],\
+                           columns = ['lower','upper']),\
+                'jackknife+' : pd.DataFrame(np.c_[y_lower_Jplus, \
+                        y_upper_Jplus],\
+                           columns = ['lower','upper']),\
+                'split' : pd.DataFrame(\
+                    np.c_[muh_split_vals_testpoint - np.sort(resids_split)[ind_split-1], \
+                           muh_split_vals_testpoint + np.sort(resids_split)[ind_split-1]],\
+                            columns = ['lower','upper']),\
+                'weighted_split' : pd.DataFrame(\
+                    np.c_[muh_split_vals_testpoint - wsplit_quantiles, \
+                           muh_split_vals_testpoint + wsplit_quantiles],\
+                            columns = ['lower','upper'])}
+        
+        
+        ###############################
+        # For each value of K in K_vals
+        ###############################
+
+        for K in K_vals:
+            ###############################
+            # CV+
+            ###############################
+            
+            ## CV+
+            n_K = np.floor(n/K).astype(int)
+            base_inds_to_delete = np.arange(n_K).astype(int)
+            resids_LKO = np.zeros(n)
+            muh_LKO_vals_testpoint = np.zeros((n,n1))
+            muh_vals_LKO_all = np.zeros(n)
+            
+            ## weights for wCV_FCS
+            unnormalized_weights_wCV_FCS = np.zeros((n + 1, n1))
+            
+            ## For each kth fold (of K folds)
+            for k in range(K):
+                inds_to_delete = (base_inds_to_delete + n_K*k).astype(int)
+                self.model.fit(np.delete(Xtrain_nxp,inds_to_delete,0),np.delete(ytrain_n,inds_to_delete))
+                muh_vals_LKO, std_vals_LKO = self.model.predict(np.r_[Xtrain_nxp[inds_to_delete],Xaug_n1xp[-n1:]], return_std=True)
+                resids_LKO[inds_to_delete] = np.abs(ytrain_n[inds_to_delete] - muh_vals_LKO[:n_K])
+                
+                ## Calculate unnormalized likelihoo-ratio weights for FCS, fit on n - n/K points
+#                 kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(np.delete(Xtrain_nxp,inds_to_delete,0)) 
+                
+                ## For each point within the kth fold
+                for inner_K in range(n_K):
+                    i = inds_to_delete[inner_K] ## index within 1:n of a deleted point
+#                     muh_vals_LKO_all[inds_to_delete[inner_K]] = self.model.predict(Xaug_n1xp[]
+                    muh_LKO_vals_testpoint[i] = muh_vals_LKO[n_K:]
+                    muh_vals_LKO_all[i] = muh_vals_LKO[inner_K]
+                    
+                    density_KLO_i = np.exp(kde.score_samples(Xaug_n1xp[i][None, :]))
+                    density_KLO_i = density_KLO_i / np.sum(density_KLO_i)
+                    density_testpoint_KLO_i = np.exp(kde.score_samples(Xaug_n1xp[-n1:]))
+                    density_testpoint_KLO_i = density_testpoint_KLO_i / np.sum(density_testpoint_KLO_i)
+                    unnormalized_weights_wCV_FCS[i] = (std_to_test_density(std_vals_LKO[inner_K]) / density_KLO_i) * (std_to_test_density(std_vals_LKO[-n1:]) / density_testpoint_KLO_i)
+            
+            ## Calculate FCS test point unnormalized weight
+#             kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xtrain_nxp) ## Fit density for n pts
+            density_testpoint = np.exp(kde.score_samples(Xaug_n1xp[-n1:])) ## Score test points
+            density_testpoint = density_testpoint / np.sum(density_testpoint)
+            unnormalized_weights_wCV_FCS[n] = (std_to_test_density(std_test) / density_testpoint)**2
+            
+#             print(np.sum(unnormalized_weights_wCV_FCS))
+            ind_Kq = (np.ceil((1-alpha)*(n+1))).astype(int)
+    
+            weights_normalized_wCV_FCS = np.zeros((n + 1, n1))
+            for j in range(0, n1):
+                weights_normalized_wCV_FCS[:,j] = unnormalized_weights_wCV_FCS[:,j] / np.sum(unnormalized_weights_wCV_FCS[:,j])
+        
+
+        
+#             print("weights_normalized_wCV_FCS")
+#             print(weights_normalized_wCV_FCS)
+
+            ###############################
+            # JAW : 
+            # wCV+: 
+            ###############################
+
+            unweighted_upper_vals_CV = (muh_LKO_vals_testpoint.T + resids_LKO).T
+            unweighted_lower_vals_CV = (muh_LKO_vals_testpoint.T - resids_LKO).T
+
+            ## Add infty (distribution on augmented real line)
+
+            unweighted_upper_vals_CV = np.vstack((unweighted_upper_vals_CV, positive_infinity*np.ones(n1)))
+            unweighted_lower_vals_CV = np.vstack((unweighted_lower_vals_CV, -positive_infinity*np.ones(n1)))
+
+            ## Get normalized weights:
+            
+            ## FCS
+#             y_upper_JAW_FCS = np.zeros(n1)
+#             y_lower_JAW_FCS = np.zeros(n1)
+
+            y_upper_wCV_FCS = np.zeros(n1)
+            y_lower_wCV_FCS = np.zeros(n1)
+
+            y_upper_JAW_FCS_KLOO_rep = np.zeros(n1)
+            y_lower_JAW_FCS_KLOO_rep = np.zeros(n1)
+            
+            y_upper_JAW_FCS_KLOO_det = np.zeros(n1)
+            y_lower_JAW_FCS_KLOO_det = np.zeros(n1)
+            
+            ## SCS
+#             y_upper_JAW_SCS = np.zeros(n1)
+#             y_lower_JAW_SCS = np.zeros(n1)
+
+            y_upper_wCV_SCS = np.zeros(n1)
+            y_lower_wCV_SCS = np.zeros(n1)
+
+            y_upper_JAW_SCS_KLOO_rep = np.zeros(n1)
+            y_lower_JAW_SCS_KLOO_rep = np.zeros(n1)
+            
+            y_upper_JAW_SCS_KLOO_det = np.zeros(n1)
+            y_lower_JAW_SCS_KLOO_det = np.zeros(n1)
+            
+
+            for j in range(0, n1):
+                y_upper_wCV_FCS[j] = weighted_quantile(unweighted_upper_vals_CV[:, j], weights_normalized_wCV_FCS[:, j], 1 - alpha)
+                y_lower_wCV_FCS[j] = weighted_quantile(unweighted_lower_vals_CV[:, j], weights_normalized_wCV_FCS[:, j], alpha)
+                y_upper_wCV_SCS[j] = weighted_quantile(unweighted_upper_vals_CV[:, j], weights_normalized_JAW_SCS[:, j], 1 - alpha)
+                y_lower_wCV_SCS[j] = weighted_quantile(unweighted_lower_vals_CV[:, j], weights_normalized_JAW_SCS[:, j], alpha)
+
+                ## K LOO sampling with replacement
+                JAW_FCS_KLOO_inds = []
+                JAW_SCS_KLOO_inds = []
+                weights_normalized_FCS_j_cum = np.cumsum(weights_normalized_JAW_FCS[:, j])
+                weights_normalized_SCS_j_cum = np.cumsum(weights_normalized_JAW_SCS[:, j])
+                while (len(set(JAW_FCS_KLOO_inds)) < K):
+                    JAW_FCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_FCS_j_cum)[0])
+                while (len(set(JAW_SCS_KLOO_inds)) < K):
+                    JAW_SCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_SCS_j_cum)[0])
+                    
+                JAW_FCS_KLOO_inds = np.array(JAW_FCS_KLOO_inds)
+                JAW_SCS_KLOO_inds = np.array(JAW_SCS_KLOO_inds)
+
+                upper_vals_JAW_FCS_KLOO_all = unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds]
+                lower_vals_JAW_FCS_KLOO_all = unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds]
+                
+                upper_vals_JAW_SCS_KLOO_all = unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds]
+                lower_vals_JAW_SCS_KLOO_all = unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds]
+
+                upper_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
+                lower_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
+                
+                upper_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
+                lower_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
+
+                y_upper_JAW_FCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_FCS_KLOO_unique[0], upper_vals_JAW_FCS_KLOO_unique[1]/np.sum(upper_vals_JAW_FCS_KLOO_unique[1]), 1 - alpha)
+                y_lower_JAW_FCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_FCS_KLOO_unique[0], lower_vals_JAW_FCS_KLOO_unique[1]/np.sum(lower_vals_JAW_FCS_KLOO_unique[1]), alpha)
+                
+                y_upper_JAW_SCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_SCS_KLOO_unique[0], upper_vals_JAW_SCS_KLOO_unique[1]/np.sum(upper_vals_JAW_SCS_KLOO_unique[1]), 1 - alpha)
+                y_lower_JAW_SCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_SCS_KLOO_unique[0], lower_vals_JAW_SCS_KLOO_unique[1]/np.sum(lower_vals_JAW_SCS_KLOO_unique[1]), alpha)
+                
+                
+                ## K LOO deterministic
+                FCS_inds_K_largest = np.concatenate((np.argpartition(weights_normalized_JAW_FCS[:n, j], -K)[-K:], [n]))
+                FCS_K_LOO_det_norm_weights = weights_normalized_JAW_FCS[:, j][FCS_inds_K_largest]/np.sum(weights_normalized_JAW_FCS[:, j][FCS_inds_K_largest])
+                
+#                 print("FCS_K_LOO_det_norm_weights!!!!")
+#                 print(FCS_K_LOO_det_norm_weights)
+#                 print(FCS_inds_K_largest)
+                y_upper_JAW_FCS_KLOO_det[j] = weighted_quantile(unweighted_upper_vals[:, j][FCS_inds_K_largest], FCS_K_LOO_det_norm_weights, 1 - alpha)
+                y_lower_JAW_FCS_KLOO_det[j] = weighted_quantile(unweighted_lower_vals[:, j][FCS_inds_K_largest], FCS_K_LOO_det_norm_weights, alpha)
+                
+                SCS_inds_K_largest = np.concatenate((np.argpartition(weights_normalized_JAW_SCS[:n, j], -K)[-K:], [n]))
+                SCS_K_LOO_det_norm_weights = weights_normalized_JAW_SCS[:, j][SCS_inds_K_largest]/np.sum(weights_normalized_JAW_SCS[:, j][SCS_inds_K_largest])
+#                 print("SCS_K_LOO_det_norm_weights!!!!")
+#                 print(SCS_K_LOO_det_norm_weights)
+#                 print(SCS_inds_K_largest)
+                y_upper_JAW_SCS_KLOO_det[j] = weighted_quantile(unweighted_upper_vals[:, j][SCS_inds_K_largest], SCS_K_LOO_det_norm_weights, 1 - alpha)
+                y_lower_JAW_SCS_KLOO_det[j] = weighted_quantile(unweighted_lower_vals[:, j][SCS_inds_K_largest], SCS_K_LOO_det_norm_weights, alpha)
+                
+
+            ## Add PIs for each K and method
+            PIs_dict['CV+_K' + str(K)] = pd.DataFrame(\
+                    np.c_[np.sort(muh_LKO_vals_testpoint.T - resids_LKO,axis=1).T[-ind_Kq], \
+                        np.sort(muh_LKO_vals_testpoint.T + resids_LKO,axis=1).T[ind_Kq-1]],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['wCV_FCS_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_wCV_FCS, \
+                        y_upper_wCV_FCS],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['wCV_SCS_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_wCV_SCS, \
+                        y_upper_wCV_SCS],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['JAW_FCS_KLOO_rep_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_JAW_FCS_KLOO_rep, \
+                        y_upper_JAW_FCS_KLOO_rep],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['JAW_SCS_KLOO_rep_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_JAW_SCS_KLOO_rep, \
+                        y_upper_JAW_SCS_KLOO_rep],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['JAW_FCS_KLOO_det_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_JAW_FCS_KLOO_det, \
+                        y_upper_JAW_FCS_KLOO_det],\
+                           columns = ['lower','upper'])
+            
+            PIs_dict['JAW_SCS_KLOO_det_K' + str(K)] = pd.DataFrame(\
+                    np.c_[y_lower_JAW_SCS_KLOO_det, \
+                        y_upper_JAW_SCS_KLOO_det],\
+                           columns = ['lower','upper'])
+            
+#             PIs_dict['muh_test'] = pd.DataFrame(muh_test,
+#                            columns = ['muh_test'])
+            
+        
+        return PIs_dict
+    
+    
 
 class ConformalExchangeable(Conformal):
     """
@@ -1193,7 +1747,40 @@ class JAWFeedbackCovariateShift(JAW_FCS):
             w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
             return w_n1
 
+
+### Drew modified
+class JAWFeedbackCovariateShiftActive(JAW_FCS_ACTIVE):
+    """
+    Class for JAW with ridge regression under feedback covariate shift
+    """
+    def __init__(self, model, ptrain_fn, Xuniv_uxp):
+        super().__init__(model, ptrain_fn, Xuniv_uxp)
+
+    def get_loo_scores_and_lrs(self, Xaug_n1xp, ytrain_n, lmbda):
+        unweighted_lower_vals, unweighted_upper_vals, weights_normalized = self.compute_loo_scores_and_lrs(Xaug_n1xp, ytrain_n, lmbda)
+        return unweighted_lower_vals, unweighted_upper_vals, weights_normalized
+
+    def get_lrs(self, Xaug_n1xp, ytrain_n, lmbda, split=False, idx=None): ### THIS IS GOING TO HAVE TO TAKE AS ARGUMENTS THIS SPLITS THEMSELVES
+        n = len(ytrain_n)
+        n1 = len(Xaug_n1xp) - n
         
+        if (split == True):
+            n_half = int(np.floor(n/2))
+            idx_train, idx_cal = idx[:n_half], idx[n_half:]
+            self.model.fit(Xaug_n1xp[idx_train],ytrain_n[idx_train])
+            pred_n1 = self.model.predict(Xaug_n1xp)
+            ptest_n1 = np.exp(lmbda * pred_n1)
+            w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
+            return w_n1
+
+        else:
+            self.model.fit(Xaug_n1xp[: -n1], ytrain_n)  # Xtrain_nxp, ytrain_n
+            # get likelihood ratios
+            pred_n1 = self.model.predict(Xaug_n1xp)
+            ptest_n1 = np.exp(lmbda * pred_n1)
+            w_n1 = ptest_n1 / self.ptrain_fn(Xaug_n1xp)
+            return w_n1
+
         
 ### Drew modified
 class SplitFeedbackCovariateShift(JAW_FCS):

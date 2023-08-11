@@ -139,7 +139,7 @@ def train(obj, params, inputs, targets, config, weights, epoch_callback=None):
         f = obj(params, X, y, weights_p)
         n = np.sqrt(np.sum(grad(params, X, y, weights_p)**2))
         msg = msg.format(i + 1, f, n)
-        logging.info(msg) ## Removed this to not have verbose training
+#         logging.info(msg) ## Removed this to not have verbose training
         
 #         if (n < 0.5):
 #             break
