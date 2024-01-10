@@ -1303,8 +1303,10 @@ class JAW_FCS_ACTIVE(ABC):
         Xaug_cal_test_split = np.vstack([Xcal_split, Xtest_1xp])
         n = ytrain_n.size
         n1 = len(Xaug_n1xp) - n
+
         
         kde = KernelDensity(kernel='gaussian', bandwidth=bandwidth).fit(Xtrain_nxp)
+
         
         ###############################
         # split conformal
@@ -1334,6 +1336,7 @@ class JAW_FCS_ACTIVE(ABC):
         positive_infinity = np.array([float('inf')])
         unweighted_split_vals = np.concatenate([resids_split, positive_infinity])
 
+
         wsplit_quantiles = np.zeros(n1)
 
         weights_normalized_wsplit = np.zeros((n_cal + 1, n1))
@@ -1356,7 +1359,7 @@ class JAW_FCS_ACTIVE(ABC):
 #             wsplit_quantiles_upper[j] = C_n[0][1]
 #             wsplit_quantiles[j] = get_randomized_staircase_coverage(C_n, ytest_n1_split)
             wsplit_quantiles[j] = weighted_quantile(unweighted_split_vals, weights_normalized_wsplit[:, j], 1 - alpha)
-        
+
         
         ###############################
         # JAW FCS & SCS
@@ -1450,7 +1453,7 @@ class JAW_FCS_ACTIVE(ABC):
             y_upper_JAW_SCS[j] = weighted_quantile(unweighted_upper_vals[:, j], weights_normalized_JAW_SCS[:, j], 1 - alpha)
             y_lower_Jplus[j] = weighted_quantile(unweighted_lower_vals[:, j], uniform_weights, alpha)
             y_upper_Jplus[j] = weighted_quantile(unweighted_upper_vals[:, j], uniform_weights, 1 - alpha)
-            
+
             
         ## Add PIs for initially non JAW or K-dependent methods
         PIs_dict = {'JAW-FCS' : pd.DataFrame(np.c_[y_lower_JAW_FCS, \
@@ -1476,10 +1479,12 @@ class JAW_FCS_ACTIVE(ABC):
         # For each value of K in K_vals
         ###############################
 
+
         for K in K_vals:
             ###############################
             # CV+
             ###############################
+
             
             ## CV+
             n_K = np.floor(n/K).astype(int)
@@ -1572,6 +1577,7 @@ class JAW_FCS_ACTIVE(ABC):
             
             y_upper_JAW_SCS_KLOO_det = np.zeros(n1)
             y_lower_JAW_SCS_KLOO_det = np.zeros(n1)
+
             
 
             for j in range(0, n1):
@@ -1585,32 +1591,49 @@ class JAW_FCS_ACTIVE(ABC):
                 JAW_SCS_KLOO_inds = []
                 weights_normalized_FCS_j_cum = np.cumsum(weights_normalized_JAW_FCS[:, j])
                 weights_normalized_SCS_j_cum = np.cumsum(weights_normalized_JAW_SCS[:, j])
-                while (len(set(JAW_FCS_KLOO_inds)) < K):
-                    JAW_FCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_FCS_j_cum)[0])
-                while (len(set(JAW_SCS_KLOO_inds)) < K):
-                    JAW_SCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_SCS_j_cum)[0])
+                
+  
+                ## For JAW_SCS_KLOO, check if the test point has normalized weight nearly equal to 1, in which case interval width will be infinite
+                if (weights_normalized_JAW_FCS[:, j][-1] >= 0.99):
+                    y_upper_JAW_FCS_KLOO_rep[j] = math.inf
+                    y_lower_JAW_FCS_KLOO_rep[j] = -math.inf
+                else:
+                    while (len(set(JAW_FCS_KLOO_inds)) < K):
+                        JAW_FCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_FCS_j_cum)[0])
                     
-                JAW_FCS_KLOO_inds = np.array(JAW_FCS_KLOO_inds)
-                JAW_SCS_KLOO_inds = np.array(JAW_SCS_KLOO_inds)
+                    JAW_FCS_KLOO_inds = np.array(JAW_FCS_KLOO_inds)
+                    
+                    upper_vals_JAW_FCS_KLOO_all = unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds]
+                    lower_vals_JAW_FCS_KLOO_all = unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds]
+                    
+                    upper_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
+                    lower_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
+    
+                    y_upper_JAW_FCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_FCS_KLOO_unique[0], upper_vals_JAW_FCS_KLOO_unique[1]/np.sum(upper_vals_JAW_FCS_KLOO_unique[1]), 1 - alpha)
+                    y_lower_JAW_FCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_FCS_KLOO_unique[0], lower_vals_JAW_FCS_KLOO_unique[1]/np.sum(lower_vals_JAW_FCS_KLOO_unique[1]), alpha)
 
-                upper_vals_JAW_FCS_KLOO_all = unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds]
-                lower_vals_JAW_FCS_KLOO_all = unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds]
-                
-                upper_vals_JAW_SCS_KLOO_all = unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds]
-                lower_vals_JAW_SCS_KLOO_all = unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds]
 
-                upper_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
-                lower_vals_JAW_FCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_FCS_KLOO_inds], return_counts=True)
+                ## For JAW_SCS_KLOO, check if the test point has normalized weight nearly equal to 1, in which case interval width will be infinite
+                if (weights_normalized_JAW_SCS[:, j][-1] >= 0.99):
+                    y_upper_JAW_SCS_KLOO_rep[j] = math.inf
+                    y_lower_JAW_SCS_KLOO_rep[j] = -math.inf
+                else:
+                    while (len(set(JAW_SCS_KLOO_inds)) < K):
+                        JAW_SCS_KLOO_inds.append(random.choices(list(range(0, n+1)), cum_weights = weights_normalized_SCS_j_cum)[0])
+                        
+                    JAW_SCS_KLOO_inds = np.array(JAW_SCS_KLOO_inds)
+    
+                    upper_vals_JAW_SCS_KLOO_all = unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds]
+                    lower_vals_JAW_SCS_KLOO_all = unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds]
+    
+                    upper_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
+                    lower_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
+    
+                    y_upper_JAW_SCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_SCS_KLOO_unique[0], upper_vals_JAW_SCS_KLOO_unique[1]/np.sum(upper_vals_JAW_SCS_KLOO_unique[1]), 1 - alpha)
+                    y_lower_JAW_SCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_SCS_KLOO_unique[0], lower_vals_JAW_SCS_KLOO_unique[1]/np.sum(lower_vals_JAW_SCS_KLOO_unique[1]), alpha)
                 
-                upper_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_upper_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
-                lower_vals_JAW_SCS_KLOO_unique = np.unique(unweighted_lower_vals[:, j][JAW_SCS_KLOO_inds], return_counts=True)
 
-                y_upper_JAW_FCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_FCS_KLOO_unique[0], upper_vals_JAW_FCS_KLOO_unique[1]/np.sum(upper_vals_JAW_FCS_KLOO_unique[1]), 1 - alpha)
-                y_lower_JAW_FCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_FCS_KLOO_unique[0], lower_vals_JAW_FCS_KLOO_unique[1]/np.sum(lower_vals_JAW_FCS_KLOO_unique[1]), alpha)
-                
-                y_upper_JAW_SCS_KLOO_rep[j] = weighted_quantile(upper_vals_JAW_SCS_KLOO_unique[0], upper_vals_JAW_SCS_KLOO_unique[1]/np.sum(upper_vals_JAW_SCS_KLOO_unique[1]), 1 - alpha)
-                y_lower_JAW_SCS_KLOO_rep[j] = weighted_quantile(lower_vals_JAW_SCS_KLOO_unique[0], lower_vals_JAW_SCS_KLOO_unique[1]/np.sum(lower_vals_JAW_SCS_KLOO_unique[1]), alpha)
-                
+
                 
                 ## K LOO deterministic
                 FCS_inds_K_largest = np.concatenate((np.argpartition(weights_normalized_JAW_FCS[:n, j], -K)[-K:], [n]))
@@ -1629,7 +1652,8 @@ class JAW_FCS_ACTIVE(ABC):
 #                 print(SCS_inds_K_largest)
                 y_upper_JAW_SCS_KLOO_det[j] = weighted_quantile(unweighted_upper_vals[:, j][SCS_inds_K_largest], SCS_K_LOO_det_norm_weights, 1 - alpha)
                 y_lower_JAW_SCS_KLOO_det[j] = weighted_quantile(unweighted_lower_vals[:, j][SCS_inds_K_largest], SCS_K_LOO_det_norm_weights, alpha)
-                
+
+
 
             ## Add PIs for each K and method
             PIs_dict['CV+_K' + str(K)] = pd.DataFrame(\
