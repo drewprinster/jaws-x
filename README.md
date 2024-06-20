@@ -8,7 +8,7 @@ This repository contains code for both a 2023 ICML paper a 2023 COPA extended ab
 
 We also build heavily on code from the following paper: Clara Fannjiang, Stephen Bates, Anastasios N Angelopoulos, Jennifer Listgarten, and Michael I Jordan. Conformal prediction under feedback covariate shift for biomolecular design. *Proceedings of the National Academy of Sciences*, 119(43):e2204569119, 2022.
 
-This repository was last updated and cleaned up on August 11th, 2023! The code should now be ready to clone and play with, though I will continue to work improving the repo's useability and clarity throughout September 2023. Please don't hestitate to reach out at **drew@cs.jhu.edu** with questions!
+This repository was last updated on June 20, 2024. Please don't hestitate to reach out at **drew@cs.jhu.edu** with questions!
 
 ---
 
